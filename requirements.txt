@@ -29,3 +29,6 @@ ultralytics
 mcap-ros2-support
 
 torch --index-url https://download.pytorch.org/whl/cu124
+
+rosbags
+pyrealsense2

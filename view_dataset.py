@@ -2,6 +2,7 @@ import os
 import glob
 import argparse
 import yaml
+import math
 import cv2
 import torch
 import tkinter as tk
@@ -35,7 +36,8 @@ class YOLOEditor:
             self.boxes = [] 
             self.scale = 1.0 
             self.selected_box_idx = None
-            self.drag_state = None 
+            self.drag_state = None
+            self.obb_corner_idx = None
             
             # --- GUI Layout ---
             
@@ -54,6 +56,8 @@ class YOLOEditor:
             root.bind("<Delete>", self.delete_selected_box)
             root.bind("<Left>", lambda e: self.prev_image())
             root.bind("<Right>", lambda e: self.next_image())
+            root.bind("[", lambda e: self.rotate_selected_box(-1))
+            root.bind("]", lambda e: self.rotate_selected_box(1))
 
             # 2. Controls Frame (Bottom)
             # We split this into two stacked rows to save horizontal space
@@ -250,6 +254,10 @@ class YOLOEditor:
                 pts = [(x*self.scale, y*self.scale) for x, y in b['pts']]
                 self.canvas.create_polygon(pts, outline=color, fill='', width=width, tags="box")
                 label_x, label_y = pts[0][0], pts[0][1] - 10  # first corner
+                if i == self.selected_box_idx:
+                    for px, py in pts:
+                        r = 5
+                        self.canvas.create_rectangle(px-r, py-r, px+r, py+r, outline=color, fill='white', width=1, tags="box")
 
             cls_name = self.classes.get(b['cls'], str(b['cls']))
             self.canvas.create_text(label_x, label_y, text=cls_name, fill=color, anchor=tk.SW, font=("Arial", 10, "bold"), tags="box")
@@ -264,19 +272,24 @@ class YOLOEditor:
             if self.selected_box_idx is not None:
                 b = self.boxes[self.selected_box_idx]
                 
-                # Only allow resizing if it is a standard YOLO box
+                threshold = 10 / self.scale
                 if b.get('type') == 'yolo':
-                    threshold = 10 / self.scale
-                    
                     # Check Top-Left
                     if abs(cx - b['x1']) < threshold and abs(cy - b['y1']) < threshold:
                         self.drag_state = 'resize_tl'
                         return
-                    
+
                     # Check Bottom-Right
                     if abs(cx - b['x2']) < threshold and abs(cy - b['y2']) < threshold:
                         self.drag_state = 'resize_br'
                         return
+
+                elif b.get('type') == 'obb':
+                    for j, (px, py) in enumerate(b['pts']):
+                        if abs(cx - px) < threshold and abs(cy - py) < threshold:
+                            self.drag_state = 'resize_obb'
+                            self.obb_corner_idx = j
+                            return
 
             # Check if clicking inside a box (select it)
             clicked_idx = None
@@ -346,6 +359,9 @@ class YOLOEditor:
             elif self.drag_state == 'resize_br' and b.get('type') == 'yolo':
                 b['x2'] = max(cx, b['x1'] + 5)
                 b['y2'] = max(cy, b['y1'] + 5)
+
+            elif self.drag_state == 'resize_obb' and b.get('type') == 'obb':
+                self._drag_obb_corner(b, self.obb_corner_idx, cx, cy)
                 
             self.redraw_boxes()
 
@@ -382,6 +398,60 @@ class YOLOEditor:
                  cls_id = int(current_cls_str.split(':')[0])
                  self.boxes[self.selected_box_idx]['cls'] = cls_id
                  self.redraw_boxes()
+
+    def _drag_obb_corner(self, b, j, new_x, new_y):
+        pts = list(b['pts'])
+        opp_idx  = (j + 2) % 4
+        adj1_idx = (j + 1) % 4
+        adj2_idx = (j + 3) % 4
+
+        opp  = pts[opp_idx]
+        adj1 = pts[adj1_idx]
+        adj2 = pts[adj2_idx]
+
+        # Edge vectors from the fixed opposite corner
+        d1 = (adj1[0] - opp[0], adj1[1] - opp[1])
+        d2 = (adj2[0] - opp[0], adj2[1] - opp[1])
+
+        len1_sq = d1[0]**2 + d1[1]**2
+        len2_sq = d2[0]**2 + d2[1]**2
+        if len1_sq == 0 or len2_sq == 0:
+            return
+
+        v = (new_x - opp[0], new_y - opp[1])
+
+        # Project new diagonal onto each edge direction to find new adjacent corners
+        t1 = (v[0]*d1[0] + v[1]*d1[1]) / len1_sq
+        t2 = (v[0]*d2[0] + v[1]*d2[1]) / len2_sq
+
+        pts[j]        = (new_x, new_y)
+        pts[adj1_idx] = (opp[0] + t1*d1[0], opp[1] + t1*d1[1])
+        pts[adj2_idx] = (opp[0] + t2*d2[0], opp[1] + t2*d2[1])
+        b['pts'] = pts
+
+    def rotate_selected_box(self, angle_deg):
+        if self.selected_box_idx is None:
+            return
+        b = self.boxes[self.selected_box_idx]
+
+        if b['type'] == 'yolo':
+            x1, y1, x2, y2 = b['x1'], b['y1'], b['x2'], b['y2']
+            pts = [(x1, y1), (x2, y1), (x2, y2), (x1, y2)]
+            b = {'cls': b['cls'], 'type': 'obb', 'pts': pts}
+            self.boxes[self.selected_box_idx] = b
+
+        cx = sum(p[0] for p in b['pts']) / 4
+        cy = sum(p[1] for p in b['pts']) / 4
+        rad = math.radians(angle_deg)
+        cos_a, sin_a = math.cos(rad), math.sin(rad)
+
+        rotated = []
+        for px, py in b['pts']:
+            dx, dy = px - cx, py - cy
+            rotated.append((cx + dx * cos_a - dy * sin_a,
+                            cy + dx * sin_a + dy * cos_a))
+        b['pts'] = rotated
+        self.redraw_boxes()
 
     def delete_selected_box(self, event=None):
         if self.selected_box_idx is not None:
