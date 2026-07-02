@@ -44,10 +44,17 @@ USAGE
         --model_cfg sam2.1_hiera_s.yaml \
         --class_id 0
 
-Outputs (per input image `foo.jpg`):
-    output_dir/images/foo.jpg                 (copied)
-    output_dir/labels/foo.txt                 (YOLO OBB labels)
-    output_dir/viz/foo.jpg                    (overlay for sanity-checking)
+Outputs:
+    output_dir/images/train/*.jpg, images/val/*.jpg, (images/test/*.jpg)
+    output_dir/labels/train/*.txt, labels/val/*.txt, (labels/test/*.txt)
+    output_dir/viz/*.jpg                      (overlay for sanity-checking, all images together)
+    output_dir/data.yaml                      (Ultralytics dataset config, ready to train against)
+
+Images are deterministically shuffled (--split_seed) and split by
+--val_ratio / --test_ratio (default 15% val, 0% test — pass --test_ratio
+to add one). Shuffling matters because sequentially-captured frames of the
+same tray are highly correlated; a naive first-N/last-N split would leak
+near-duplicate frames between train and val.
 
 Default label format is YOLO-OBB (Ultralytics):
     <class_id> x1 y1 x2 y2 x3 y3 x4 y4          (all coords normalized 0-1)
@@ -103,7 +110,7 @@ def parse_args():
     p.add_argument("--input_dir", required=True, help="Folder of tray photos (.jpg/.png)")
     p.add_argument("--output_dir", required=True, help="Where to write images/labels/viz")
     p.add_argument("--checkpoint", required=True, help="Path to SAM2 .pt checkpoint")
-    p.add_argument("--model_cfg", default="sam2.1_hiera_s.yaml", help="SAM2 model config name")
+    p.add_argument("--model_cfg", default="configs/sam2.1/sam2.1_hiera_s.yaml", help="SAM2 model config name")
     p.add_argument("--device", default="cuda", help="cuda or cpu")
     p.add_argument("--class_id", type=int, default=0, help="YOLO class id to assign to every bottle")
     p.add_argument("--points_per_side", type=int, default=64,
@@ -130,6 +137,14 @@ def parse_args():
     p.add_argument("--poly_epsilon_ratio", type=float, default=0.004,
                    help="cv2.approxPolyDP epsilon as a fraction of contour perimeter, "
                         "to simplify mask polygons for the label file.")
+    p.add_argument("--val_ratio", type=float, default=0.15,
+                   help="Fraction of images assigned to the val split.")
+    p.add_argument("--test_ratio", type=float, default=0.0,
+                   help="Fraction of images assigned to the test split (0 = no test split).")
+    p.add_argument("--split_seed", type=int, default=42,
+                   help="Seed for shuffling images before splitting, for reproducibility.")
+    p.add_argument("--class_name", default="bottle",
+                   help="Human-readable class name written into data.yaml.")
     return p.parse_args()
 
 
@@ -272,6 +287,53 @@ def mask_to_yolo_bbox(mask_dict, img_w, img_h, class_id):
     return f"{class_id} {cx:.6f} {cy:.6f} {nw:.6f} {nh:.6f}"
 
 
+def assign_splits(image_files, val_ratio, test_ratio, seed):
+    """
+    Deterministically shuffle and assign each filename to 'train', 'val', or
+    'test'. Shuffling (rather than a straight slice) matters here because
+    your images were likely captured in sequence (similar tray, similar
+    lighting, similar frame-to-frame), so a naive first-N/last-N split could
+    put near-duplicate frames only in train or only in val and give you a
+    misleadingly optimistic (or pessimistic) val score.
+    """
+    files = list(image_files)
+    rng = np.random.default_rng(seed)
+    rng.shuffle(files)
+
+    n = len(files)
+    n_val = int(round(n * val_ratio))
+    n_test = int(round(n * test_ratio))
+    n_val = min(n_val, n)
+    n_test = min(n_test, n - n_val)
+
+    val_set = set(files[:n_val])
+    test_set = set(files[n_val:n_val + n_test])
+    split_map = {}
+    for f in files:
+        if f in val_set:
+            split_map[f] = "val"
+        elif f in test_set:
+            split_map[f] = "test"
+        else:
+            split_map[f] = "train"
+    return split_map
+
+
+def write_data_yaml(output_dir, class_name, has_test):
+    lines = [
+        f"path: {os.path.abspath(output_dir)}",
+        "train: images/train",
+        "val: images/val",
+    ]
+    if has_test:
+        lines.append("test: images/test")
+    lines.append("")
+    lines.append("names:")
+    lines.append(f"  0: {class_name}")
+    with open(os.path.join(output_dir, "data.yaml"), "w") as f:
+        f.write("\n".join(lines))
+
+
 def draw_viz(img, masks, show_obb=True):
     overlay = img.copy()
     rng = np.random.default_rng(0)
@@ -294,18 +356,24 @@ def draw_viz(img, masks, show_obb=True):
 def main():
     args = parse_args()
 
-    os.makedirs(os.path.join(args.output_dir, "images"), exist_ok=True)
-    os.makedirs(os.path.join(args.output_dir, "labels"), exist_ok=True)
-    os.makedirs(os.path.join(args.output_dir, "viz"), exist_ok=True)
-
-    print("Loading SAM2 (this can take a minute)...")
-    mask_generator = build_mask_generator(args)
-
     exts = (".jpg", ".jpeg", ".png", ".bmp")
     image_files = sorted(f for f in os.listdir(args.input_dir) if f.lower().endswith(exts))
     if not image_files:
         print(f"No images found in {args.input_dir}", file=sys.stderr)
         sys.exit(1)
+
+    split_map = assign_splits(image_files, args.val_ratio, args.test_ratio, args.split_seed)
+    has_test = args.test_ratio > 0
+    splits_present = sorted(set(split_map.values()))
+    for split in splits_present:
+        os.makedirs(os.path.join(args.output_dir, "images", split), exist_ok=True)
+        os.makedirs(os.path.join(args.output_dir, "labels", split), exist_ok=True)
+    os.makedirs(os.path.join(args.output_dir, "viz"), exist_ok=True)
+
+    counts = {s: 0 for s in splits_present}
+
+    print("Loading SAM2 (this can take a minute)...")
+    mask_generator = build_mask_generator(args)
 
     for fname in image_files:
         in_path = os.path.join(args.input_dir, fname)
@@ -349,14 +417,20 @@ def main():
                 label_lines.append(mask_to_yolo_obb(m, full_w, full_h, args.class_id))
 
         stem = os.path.splitext(fname)[0]
-        with open(os.path.join(args.output_dir, "labels", stem + ".txt"), "w") as f:
+        split = split_map[fname]
+        counts[split] += 1
+        with open(os.path.join(args.output_dir, "labels", split, stem + ".txt"), "w") as f:
             f.write("\n".join(label_lines))
 
-        shutil.copy2(in_path, os.path.join(args.output_dir, "images", fname))
+        shutil.copy2(in_path, os.path.join(args.output_dir, "images", split, fname))
 
         viz = draw_viz(img_bgr, kept)
         cv2.imwrite(os.path.join(args.output_dir, "viz", fname), viz)
 
+    write_data_yaml(args.output_dir, args.class_name, has_test)
+
+    print("\nSplit summary:", ", ".join(f"{s}={n}" for s, n in counts.items()))
+    print(f"Wrote {os.path.join(args.output_dir, 'data.yaml')}")
     print("\nDone. Check the viz/ folder first on a handful of images before")
     print("trusting the full batch — tune --min_area_ratio / --max_area_ratio /")
     print("--points_per_side / --crop_box based on what you see there.")
