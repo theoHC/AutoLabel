@@ -24,6 +24,7 @@ git clone https://github.com/facebookresearch/segment-anything-2.git
 cd segment-anything-2 && pip install -e . && cd ..
 ```
 # 3. Auto-label your images for yolo
+You need to manually synchronize the array of classes in auto_label.py with the classes in prompts.yaml. Make sure you're consistent with class and folder names.
 ```
 python auto_label.py \
     --input ./output \
@@ -61,7 +62,16 @@ By default, reads from `./data` and writes to `./output`. Override with environm
 DATA_ROOT=./my_data OUTPUT_ROOT=./my_output python extract_data.py
 ```
 
-### Expected Structure
+to use .bag files produced by realsense 2.57 or earlier, use
+```
+---
+
+## Extracting Frames from MCAP Files
+```bash
+python extract_data_rs.py
+```
+
+### Expected Structure For Autolabel
 
 **Input:**
 ```
@@ -82,6 +92,9 @@ output/
 ```
 
 The output is ready for `auto_label.py --input ./output`.
+
+### bottle_labler.py
+This is a janky experiment in autolabeling trays of bottles by using SAM2 on its own with grids of points. It works so-so, and is invoked similarly to auto_label.
 
 ---
 
@@ -165,6 +178,8 @@ yolo detect train \
 | `yolov8x.pt` | Extra Large (most accurate) |
 
 ---
+
+To train locally, ensure finetune.py is pointed at your dataset and has the correct YOLO task and version set.
 
 ## Notes
 
