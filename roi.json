@@ -1,0 +1,11 @@
+{
+  "x1": 130,
+  "y1": 65,
+  "x2": 480,
+  "y2": 344,
+  "image_size": {
+    "width": 640,
+    "height": 480
+  },
+  "frame": "data/testing_only/commision.png"
+}

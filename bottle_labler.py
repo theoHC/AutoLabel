@@ -31,7 +31,8 @@ downloading the checkpoint will NOT work from a network-restricted sandbox)
         https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_small.pt
 
     # The matching model config ships with the sam2 pip package, referenced
-    # below by name: "sam2.1_hiera_s.yaml"
+    # below as a path relative to the sam2 package's config root:
+    # "configs/sam2.1/sam2.1_hiera_s.yaml"
 
 -----------------------------------------------------------------------------
 USAGE
@@ -41,7 +42,7 @@ USAGE
         --input_dir /path/to/tray_images \
         --output_dir /path/to/yolo_dataset \
         --checkpoint checkpoints/sam2.1_hiera_small.pt \
-        --model_cfg sam2.1_hiera_s.yaml \
+        --model_cfg configs/sam2.1/sam2.1_hiera_s.yaml \
         --class_id 0
 
 Outputs (per input image `foo.jpg`):
@@ -68,9 +69,18 @@ TUNING NOTES (read this before you run it on your real folder)
    look like they're ~35-40px apart in the uploaded photo. Default SAM2
    automatic mask generator uses points_per_side=32 across the WHOLE image,
    which is far too sparse for a tray that only occupies part of the frame.
-   Crop to the tray first (--crop_box, or run --interactive_crop once to
-   click it) so the point grid concentrates on the objects you care about,
+   Crop to the tray first (--crop_box, or --roi_json for a fixed-camera
+   setup) so the point grid concentrates on the objects you care about,
    and raise points_per_side to 64-96.
+
+   For a FIXED camera + a tray that's always roughly the same regular grid
+   (this is your setup), skip the blind uniform point grid entirely: run
+   --calibrate_grid once to click 3 points (a cap, its right neighbor, its
+   bottom neighbor) on a reference photo, then pass --grid_predict
+   --grid_calib_json <that file> to prompt SAM2 exactly once per expected
+   slot instead of hoping a uniform grid happens to land on every cap. A
+   slot with no bottle (partial/empty tray) simply scores below
+   pred_iou_thresh and is skipped -- no need to know which slots are filled.
 
 2. area filtering: this is the key knob. After generating all masks, we
    compute the area of every mask, take the MEDIAN area of masks in a
@@ -100,10 +110,12 @@ import numpy as np
 
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--input_dir", required=True, help="Folder of tray photos (.jpg/.png)")
-    p.add_argument("--output_dir", required=True, help="Where to write images/labels/viz")
-    p.add_argument("--checkpoint", required=True, help="Path to SAM2 .pt checkpoint")
-    p.add_argument("--model_cfg", default="sam2.1_hiera_s.yaml", help="SAM2 model config name")
+    p.add_argument("--input_dir", help="Folder of tray photos (.jpg/.png)")
+    p.add_argument("--output_dir", help="Where to write images/labels/viz")
+    p.add_argument("--checkpoint", help="Path to SAM2 .pt checkpoint")
+    p.add_argument("--model_cfg", default="configs/sam2.1/sam2.1_hiera_s.yaml",
+                   help="SAM2 model config name, as a path relative to the sam2 package's config "
+                        "root (Hydra searches from inside the installed sam2 package).")
     p.add_argument("--device", default="cuda", help="cuda or cpu")
     p.add_argument("--class_id", type=int, default=0, help="YOLO class id to assign to every bottle")
     p.add_argument("--points_per_side", type=int, default=64,
@@ -123,6 +135,29 @@ def parse_args():
                    metavar=("X1", "Y1", "X2", "Y2"),
                    help="Optional pixel box to crop to the tray before segmenting, "
                         "e.g. --crop_box 300 60 720 400. Strongly recommended.")
+    p.add_argument("--roi_json", default=None,
+                   help="Path to a JSON file with a fixed ROI as {'x1':.., 'y1':.., 'x2':.., 'y2':..}. "
+                        "For a fixed camera this is the recommended way to set the crop; "
+                        "takes precedence over --crop_box if both are given.")
+    p.add_argument("--grid_predict", action="store_true",
+                   help="Use a calibrated grid of point prompts (see --calibrate_grid) fed one at a "
+                        "time to SAM2's point-prompted predictor, instead of the automatic mask "
+                        "generator's blind uniform point grid. Use this for a fixed camera + "
+                        "regularly-spaced tray, where a missed cap is costlier than a slightly-off box.")
+    p.add_argument("--grid_calib_json", default=None,
+                   help="Path to the calibration JSON produced by --calibrate_grid (origin/row_vec/"
+                        "col_vec/n_rows/n_cols, in ROI-local pixel coords). Required with --grid_predict.")
+    p.add_argument("--calibrate_grid", action="store_true",
+                   help="Interactive one-time setup: click 3 points on a reference image (a cap, its "
+                        "right neighbor, its bottom neighbor) to define the tray's point grid, then "
+                        "save it to --calib_output and exit. Does not need --checkpoint/--input_dir/"
+                        "--output_dir. Re-run this if the camera or tray fixture changes.")
+    p.add_argument("--ref_image", default=None,
+                   help="Reference image to click points on. Used with --calibrate_grid.")
+    p.add_argument("--n_rows", type=int, default=None, help="Bottle rows in the tray (--calibrate_grid).")
+    p.add_argument("--n_cols", type=int, default=None, help="Bottle columns in the tray (--calibrate_grid).")
+    p.add_argument("--calib_output", default="grid_calib.json",
+                   help="Output path for the grid calibration JSON (--calibrate_grid).")
     p.add_argument("--bbox_only", action="store_true",
                    help="Write plain axis-aligned YOLO detection labels instead of OBB.")
     p.add_argument("--seg", action="store_true",
@@ -131,6 +166,145 @@ def parse_args():
                    help="cv2.approxPolyDP epsilon as a fraction of contour perimeter, "
                         "to simplify mask polygons for the label file.")
     return p.parse_args()
+
+
+def load_crop_box(args):
+    """--roi_json (fixed-camera ROI file) takes precedence over --crop_box."""
+    if args.roi_json:
+        with open(args.roi_json) as f:
+            d = json.load(f)
+        return [int(d["x1"]), int(d["y1"]), int(d["x2"]), int(d["y2"])]
+    if args.crop_box:
+        return list(args.crop_box)
+    return None
+
+
+def calibrate_grid(args):
+    """
+    Interactive one-time setup for --grid_predict: click a cap's center, its
+    right neighbor, and its bottom neighbor on a reference image. The two
+    resulting offset vectors encode both spacing and any tray rotation/tilt,
+    so the full n_rows x n_cols grid can be extrapolated from just these 3
+    points without assuming the camera is perfectly perpendicular to the tray.
+    """
+    img = cv2.imread(args.ref_image)
+    if img is None:
+        print(f"Could not read {args.ref_image}", file=sys.stderr)
+        sys.exit(1)
+
+    crop_box = load_crop_box(args)
+    proc = img
+    if crop_box:
+        x1, y1, x2, y2 = crop_box
+        proc = img[y1:y2, x1:x2]
+
+    points = []
+    window = "Click: 1) a cap center  2) its RIGHT neighbor  3) its BOTTOM neighbor  (r=reset, Enter=confirm, Esc=cancel)"
+
+    def redraw():
+        display = proc.copy()
+        for i, p in enumerate(points):
+            cv2.circle(display, p, 5, (0, 0, 255), -1)
+            cv2.putText(display, str(i + 1), (p[0] + 8, p[1] - 8),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+        if len(points) >= 2:
+            cv2.line(display, points[0], points[1], (255, 0, 0), 1)
+        if len(points) >= 3:
+            cv2.line(display, points[0], points[2], (0, 255, 255), 1)
+        cv2.imshow(window, display)
+
+    def on_click(event, x, y, _flags, _param):
+        if event == cv2.EVENT_LBUTTONDOWN and len(points) < 3:
+            points.append((x, y))
+            redraw()
+
+    cv2.namedWindow(window)
+    cv2.setMouseCallback(window, on_click)
+    redraw()
+    while True:
+        key = cv2.waitKey(20) & 0xFF
+        if key == ord("r"):
+            points.clear()
+            redraw()
+        elif key in (13, 10) and len(points) == 3:
+            break
+        elif key == 27:
+            print("Cancelled.")
+            cv2.destroyAllWindows()
+            return
+    cv2.destroyAllWindows()
+
+    origin = np.array(points[0], dtype=np.float64)
+    col_vec = (np.array(points[1], dtype=np.float64) - origin).tolist()
+    row_vec = (np.array(points[2], dtype=np.float64) - origin).tolist()
+
+    calib = {
+        "origin": origin.tolist(),
+        "col_vec": col_vec,
+        "row_vec": row_vec,
+        "n_rows": args.n_rows,
+        "n_cols": args.n_cols,
+        "note": "coordinates are relative to the cropped ROI (roi_json/crop_box), not the full image",
+    }
+    with open(args.calib_output, "w") as f:
+        json.dump(calib, f, indent=2)
+    print(f"Saved grid calibration to {args.calib_output}:")
+    print(json.dumps(calib, indent=2))
+
+
+def load_grid_points(grid_calib_json):
+    """Extrapolate the full n_rows x n_cols grid from a --calibrate_grid JSON."""
+    with open(grid_calib_json) as f:
+        calib = json.load(f)
+    origin = np.array(calib["origin"], dtype=np.float64)
+    col_vec = np.array(calib["col_vec"], dtype=np.float64)
+    row_vec = np.array(calib["row_vec"], dtype=np.float64)
+    points = [
+        origin + j * col_vec + i * row_vec
+        for i in range(calib["n_rows"])
+        for j in range(calib["n_cols"])
+    ]
+    return np.array(points)
+
+
+def build_predictor(args):
+    """Lazily import torch/sam2 so --help and --calibrate_grid work without them installed."""
+    from sam2.build_sam import build_sam2
+    from sam2.sam2_image_predictor import SAM2ImagePredictor
+
+    sam2_model = build_sam2(args.model_cfg, args.checkpoint, device=args.device)
+    return SAM2ImagePredictor(sam2_model)
+
+
+def generate_grid_masks(predictor, img_rgb, grid_points, args):
+    """
+    Prompt SAM2 once per calibrated grid slot instead of a blind uniform grid.
+    A slot with no bottle simply won't score above pred_iou_thresh and is
+    dropped here -- this is what makes partial/empty trays work automatically,
+    with no need to know in advance which slots are occupied.
+    """
+    predictor.set_image(img_rgb)
+    masks = []
+    for pt in grid_points:
+        point_coords = np.array([pt])
+        point_labels = np.array([1])
+        pred_masks, scores, _ = predictor.predict(
+            point_coords=point_coords, point_labels=point_labels, multimask_output=True
+        )
+        best = int(np.argmax(scores))
+        if scores[best] < args.pred_iou_thresh:
+            continue  # empty slot: no bottle under this point
+
+        seg = pred_masks[best].astype(bool)
+        area = int(seg.sum())
+        if area < args.min_mask_region_area:
+            continue
+
+        ys, xs = np.where(seg)
+        bbox = [int(xs.min()), int(ys.min()), int(xs.max() - xs.min()), int(ys.max() - ys.min())]
+        masks.append({"segmentation": seg, "area": area, "bbox": bbox})
+
+    return masks
 
 
 def build_mask_generator(args):
@@ -294,12 +468,33 @@ def draw_viz(img, masks, show_obb=True):
 def main():
     args = parse_args()
 
+    if args.calibrate_grid:
+        if not args.ref_image or not args.n_rows or not args.n_cols:
+            print("--calibrate_grid requires --ref_image, --n_rows, and --n_cols", file=sys.stderr)
+            sys.exit(1)
+        calibrate_grid(args)
+        return
+
+    if not (args.input_dir and args.output_dir and args.checkpoint):
+        print("--input_dir, --output_dir, and --checkpoint are required "
+              "(unless using --calibrate_grid)", file=sys.stderr)
+        sys.exit(1)
+    if args.grid_predict and not args.grid_calib_json:
+        print("--grid_predict requires --grid_calib_json (see --calibrate_grid)", file=sys.stderr)
+        sys.exit(1)
+
     os.makedirs(os.path.join(args.output_dir, "images"), exist_ok=True)
     os.makedirs(os.path.join(args.output_dir, "labels"), exist_ok=True)
     os.makedirs(os.path.join(args.output_dir, "viz"), exist_ok=True)
 
+    crop_box = load_crop_box(args)
+
     print("Loading SAM2 (this can take a minute)...")
-    mask_generator = build_mask_generator(args)
+    if args.grid_predict:
+        predictor = build_predictor(args)
+        grid_points = load_grid_points(args.grid_calib_json)
+    else:
+        mask_generator = build_mask_generator(args)
 
     exts = (".jpg", ".jpeg", ".png", ".bmp")
     image_files = sorted(f for f in os.listdir(args.input_dir) if f.lower().endswith(exts))
@@ -317,17 +512,20 @@ def main():
         offset_x, offset_y = 0, 0
         full_h, full_w = img_bgr.shape[:2]
         proc_img = img_bgr
-        if args.crop_box:
-            x1, y1, x2, y2 = args.crop_box
+        if crop_box:
+            x1, y1, x2, y2 = crop_box
             proc_img = img_bgr[y1:y2, x1:x2]
             offset_x, offset_y = x1, y1
 
         img_rgb = cv2.cvtColor(proc_img, cv2.COLOR_BGR2RGB)
-        raw_masks = mask_generator.generate(img_rgb)
+        if args.grid_predict:
+            raw_masks = generate_grid_masks(predictor, img_rgb, grid_points, args)
+        else:
+            raw_masks = mask_generator.generate(img_rgb)
         kept = filter_masks(raw_masks, args)
 
         # Shift mask coordinates back to full-image space if we cropped
-        if args.crop_box:
+        if crop_box:
             for m in kept:
                 full_seg = np.zeros((full_h, full_w), dtype=bool)
                 ph, pw = m["segmentation"].shape
@@ -358,8 +556,12 @@ def main():
         cv2.imwrite(os.path.join(args.output_dir, "viz", fname), viz)
 
     print("\nDone. Check the viz/ folder first on a handful of images before")
-    print("trusting the full batch — tune --min_area_ratio / --max_area_ratio /")
-    print("--points_per_side / --crop_box based on what you see there.")
+    if args.grid_predict:
+        print("trusting the full batch — tune --min_area_ratio / --max_area_ratio /")
+        print("--pred_iou_thresh, or re-run --calibrate_grid, based on what you see there.")
+    else:
+        print("trusting the full batch — tune --min_area_ratio / --max_area_ratio /")
+        print("--points_per_side / --crop_box / --roi_json based on what you see there.")
 
 
 if __name__ == "__main__":
