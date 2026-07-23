@@ -13,10 +13,7 @@ from pathlib import Path
 
 # --- CONFIGURATION: MAP FOLDERS TO OUTPUT CLASSES ---
 FOLDER_MAPPING = {
-    "db_class_191":    ["db_class_191"],
-    "40ft_reefer":     ["40ft_reefer"],
-    "nyc_caboose":     ["nyc_caboose"],
-    "kato_controller": ["direction_switch", "speed_knob"]
+    "Puck_tracking_1_moving":    ["PerfPro_Puck"],
 }
 
 # Automatically generate the master list of ID numbers for YOLO
@@ -101,14 +98,63 @@ def load_prompt_map(yaml_path):
     with open(yaml_path, 'r') as f:
         return yaml.safe_load(f)
 
+def unique_filename(name, used_names):
+    if name not in used_names:
+        used_names.add(name)
+        return name
+
+    stem, ext = os.path.splitext(name)
+    counter = 1
+    candidate = f"{stem}_{counter}{ext}"
+    while candidate in used_names:
+        counter += 1
+        candidate = f"{stem}_{counter}{ext}"
+    used_names.add(candidate)
+    return candidate
+
 def process_dataset(input_dir, output_dir, prompt_config_path, bbox_format,
                     threshold=0.35, device="cuda", split_ratio=0.8,
-                    sample_rate=10, use_yolo=False, yolo_model_path=None):
+                    sample_rate=10, use_yolo=False, yolo_model_path=None,
+                    extend=False, include_undetected=False):
+
+    dataset_yaml_path = os.path.join(output_dir, 'dataset.yaml')
+    images_train_dir = os.path.join(output_dir, 'images', 'train')
+    has_existing_data = os.path.isfile(dataset_yaml_path) or (
+        os.path.isdir(images_train_dir) and len(os.listdir(images_train_dir)) > 0
+    )
+
+    if has_existing_data and not extend:
+        raise SystemExit(
+            f"Output directory '{output_dir}' already contains a dataset. "
+            "Pass --extend to add to it, or choose a different --output."
+        )
+
+    # Determine the class list / ids to use. When extending, we must reuse the
+    # existing dataset's class ids so previously-written label files stay valid,
+    # and only append any brand-new classes at the end.
+    if extend and os.path.isfile(dataset_yaml_path):
+        with open(dataset_yaml_path, 'r') as f:
+            existing_yaml = yaml.safe_load(f)
+        class_names = [existing_yaml['names'][i] for i in sorted(existing_yaml['names'].keys())]
+        for name in YOLO_LABELS:
+            if name not in class_names:
+                class_names.append(name)
+        print(f"Extending existing dataset at '{output_dir}'. Merged class list: {class_names}")
+    else:
+        class_names = list(YOLO_LABELS)
 
     # Setup directories
     subdirs = ['images/train', 'images/val', 'labels/train', 'labels/val']
     for sd in subdirs:
         os.makedirs(os.path.join(output_dir, sd), exist_ok=True)
+
+    # Track filenames already present on disk (from an extended dataset) plus
+    # any assigned during this run, so newly gathered images never collide.
+    used_filenames = set()
+    for split in ('train', 'val'):
+        img_dir = os.path.join(output_dir, 'images', split)
+        if os.path.isdir(img_dir):
+            used_filenames.update(os.listdir(img_dir))
 
     prompt_map = load_prompt_map(prompt_config_path)
 
@@ -141,13 +187,16 @@ def process_dataset(input_dir, output_dir, prompt_config_path, bbox_format,
         rgb_folder = os.path.join(input_dir, folder_name, "rgb")
         if not os.path.exists(rgb_folder): continue
 
-        # Prompt setup (Even if using YOLO, we check logic)
-        raw_prompt = prompt_map.get(folder_name, "")
-        
         # Determine Multi-Class Logic
         is_multi_class = len(output_classes) > 1
         prompt_parts = []
         text_prompt = ""
+
+        # Prompt setup (Even if using YOLO, we check logic). Keyed by the
+        # output class(es) from FOLDER_MAPPING, not the folder name, so any
+        # folder mapped to the same class(es) shares one prompts.yaml entry.
+        prompt_key = output_classes[0] if not is_multi_class else "|".join(output_classes)
+        raw_prompt = prompt_map.get(prompt_key, "")
 
         if not use_yolo:
             # Prepare DINO prompts
@@ -165,9 +214,10 @@ def process_dataset(input_dir, output_dir, prompt_config_path, bbox_format,
         subset = files[::sample_rate]
 
         for fname in subset:
+            candidate_name = unique_filename(f"{folder_name}_{fname}", used_filenames)
             all_samples.append({
                 'src_path': os.path.join(rgb_folder, fname),
-                'filename': f"{folder_name}_{fname}",
+                'filename': candidate_name,
                 'text_prompt': text_prompt,
                 'output_classes': output_classes,
                 'is_multi_class': is_multi_class,
@@ -217,7 +267,7 @@ def process_dataset(input_dir, output_dir, prompt_config_path, bbox_format,
                         
                         target_class_name = sample['output_classes'][0]
                         try:
-                            cid = YOLO_LABELS.index(target_class_name)
+                            cid = class_names.index(target_class_name)
                             candidate_boxes.append((b_xyxy, cid))
                         except ValueError: continue
 
@@ -252,17 +302,17 @@ def process_dataset(input_dir, output_dir, prompt_config_path, bbox_format,
 
                     if target_class_name:
                         try:
-                            cid = YOLO_LABELS.index(target_class_name)
+                            cid = class_names.index(target_class_name)
                             candidate_boxes.append((box.reshape(1, 4), cid))
                         except ValueError: continue
 
-            if not candidate_boxes: continue
+            if not candidate_boxes and not include_undetected: continue
 
             # ==============================
             # SHARED: SAM2 SEGMENTATION
             # ==============================
             final_labels = []
-            
+
             for (box, class_id) in candidate_boxes:
                 predictor.set_image(image_rgb)
                 masks, _, _ = predictor.predict(box=box, multimask_output=False)
@@ -276,7 +326,7 @@ def process_dataset(input_dir, output_dir, prompt_config_path, bbox_format,
                         obb = mask_to_obb(m, (h, w), class_id)
                         if obb: final_labels.append(obb)
 
-            if not final_labels: continue
+            if not final_labels and not include_undetected: continue
 
             # Save
             dest_img_path = os.path.join(output_dir, 'images', split_name, sample['filename'])
@@ -286,7 +336,7 @@ def process_dataset(input_dir, output_dir, prompt_config_path, bbox_format,
             dest_label_path = os.path.join(output_dir, 'labels', split_name, label_name)
             save_labels(dest_label_path, final_labels)
 
-    create_dataset_yaml(output_dir, YOLO_LABELS)
+    create_dataset_yaml(output_dir, class_names)
     print("\nProcessing Complete.")
 
 if __name__ == "__main__":
@@ -297,15 +347,24 @@ if __name__ == "__main__":
     parser.add_argument("--bbox-format", choices=["yolo", "obb"], default="yolo")
     parser.add_argument("--sample-rate", type=int, default=10)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--threshold", type=float, default=0.35,
+                        help="Grounding DINO box/text confidence threshold (lower catches more, but riskier false positives)")
     
     # YOLO Specific Args
     parser.add_argument("--yolo", action="store_true", help="Use YOLO model instead of Grounding DINO")
-    parser.add_argument("--model-path", type=str, 
+    parser.add_argument("--model-path", type=str,
                         default=str(Path(__file__).resolve().parent / "models" / "train_topview_obb.pt"),
                         help="Path to .pt model file for YOLO")
-    
+    parser.add_argument("--extend", action="store_true",
+                        help="Extend an existing dataset in --output instead of refusing to run. "
+                             "Merges class lists and avoids filename collisions with existing data.")
+    parser.add_argument("--include-undetected", action="store_true",
+                        help="Copy every sampled image into the dataset even when no object is "
+                             "detected/segmented, writing an empty label file for manual annotation.")
+
     args = parser.parse_args()
 
-    process_dataset(args.input, args.output, args.prompts, args.bbox_format, 
-                    sample_rate=args.sample_rate, device=args.device,
-                    use_yolo=args.yolo, yolo_model_path=args.model_path)
+    process_dataset(args.input, args.output, args.prompts, args.bbox_format,
+                    threshold=args.threshold, sample_rate=args.sample_rate, device=args.device,
+                    use_yolo=args.yolo, yolo_model_path=args.model_path,
+                    extend=args.extend, include_undetected=args.include_undetected)
