@@ -3,6 +3,13 @@ __pycache__/
 *.py[codz]
 *$py.class
 
+*.jpg
+*.png
+*/data.yaml
+*/dataset.yaml
+*/labels/*
+runs/*
+
 # C extensions
 *.so
 
